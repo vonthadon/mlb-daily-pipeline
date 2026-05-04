@@ -79,20 +79,33 @@ def regress_era(raw_era, innings_pitched):
     return round(raw_era * weight + LEAGUE_AVG_ERA * (1 - weight), 2)
 
 
-def shrink_lambda(team_rpg, opp_regressed_era):
-    raw = team_rpg * (opp_regressed_era / LEAGUE_AVG_ERA)
+def advanced_pitching_score(stats):
+    xera = _safe_float(stats.get('xera'), LEAGUE_AVG_ERA)
+    whip = _safe_float(stats.get('whip'), 1.30)
+    k_pct = _safe_float(stats.get('k_pct'), 22.0)
+    bb_pct = _safe_float(stats.get('bb_pct'), 8.0)
+    hard_hit = _safe_float(stats.get('hard_hit_pct'), 39.0)
+    barrel = _safe_float(stats.get('barrel_pct'), 8.0)
+    whiff = _safe_float(stats.get('whiff_pct'), 24.0)
+    score = xera
+    score += (whip - 1.30) * 0.60
+    score += (bb_pct - 8.0) * 0.035
+    score += (hard_hit - 39.0) * 0.018
+    score += (barrel - 8.0) * 0.055
+    score -= (k_pct - 22.0) * 0.030
+    score -= (whiff - 24.0) * 0.015
+    return float(np.clip(score, 2.7, 6.3))
+
+
+def shrink_lambda(team_rpg, opp_pitch_metric):
+    raw = team_rpg * (opp_pitch_metric / LEAGUE_AVG_ERA)
     shrunk = LEAGUE_AVG_RPG + (raw - LEAGUE_AVG_RPG) * (1 - RUN_ENV_SHRINK)
     return float(np.clip(shrunk, 2.8, 6.2))
 
 
 def get_team_standings():
     url = f'{MLB_API}/v1/standings'
-    params = {
-        'leagueId': '103,104',
-        'season': date.today().year,
-        'standingsTypes': 'regularSeason',
-        'hydrate': 'team,record',
-    }
+    params = {'leagueId': '103,104', 'season': date.today().year, 'standingsTypes': 'regularSeason', 'hydrate': 'team,record'}
     records = {}
     try:
         resp = requests.get(url, params=params, timeout=20)
@@ -104,25 +117,16 @@ def get_team_standings():
                 gp = w + l or 1
                 rs = tr.get('runsScored', 0) or 0
                 ra = tr.get('runsAllowed', 0) or 0
-                records[name] = {
-                    'wins': w,
-                    'losses': l,
-                    'win_pct': _safe_float(tr.get('winningPercentage'), 0.5),
-                    'pyth': pythagorean(rs, ra),
-                    'run_diff': rs - ra,
-                    'gp': gp,
-                    'rs_per_g': rs / gp if rs else LEAGUE_AVG_RPG,
-                    'ra_per_g': ra / gp if ra else LEAGUE_AVG_RPG,
-                }
+                records[name] = {'wins': w, 'losses': l, 'win_pct': _safe_float(tr.get('winningPercentage'), 0.5), 'pyth': pythagorean(rs, ra), 'run_diff': rs - ra, 'gp': gp, 'rs_per_g': rs / gp if rs else LEAGUE_AVG_RPG, 'ra_per_g': ra / gp if ra else LEAGUE_AVG_RPG}
     except Exception as e:
         logger.error(f'Standings fetch error: {e}')
     return records
 
 
-def monte_carlo_game(home_rpg, away_rpg, home_pitcher_era, away_pitcher_era, n=MC_SIMULATIONS):
+def monte_carlo_game(home_rpg, away_rpg, home_pitch_metric, away_pitch_metric, n=MC_SIMULATIONS):
     rng = np.random.default_rng()
-    home_lambda = shrink_lambda(home_rpg, away_pitcher_era)
-    away_lambda = shrink_lambda(away_rpg, home_pitcher_era)
+    home_lambda = shrink_lambda(home_rpg, away_pitch_metric)
+    away_lambda = shrink_lambda(away_rpg, home_pitch_metric)
     home_runs = rng.poisson(home_lambda, n)
     away_runs = rng.poisson(away_lambda, n)
     ties = home_runs == away_runs
@@ -136,20 +140,10 @@ def monte_carlo_game(home_rpg, away_rpg, home_pitcher_era, away_pitcher_era, n=M
     over_probs = {}
     for line in [6.5, 7.0, 7.5, 8.0, 8.5, 9.0, 9.5]:
         over_probs[str(line)] = round(float(np.mean(totals > line)) * 100, 1)
-    return {
-        'home_win_pct': round(float(np.mean(home_wins_mask)) * 100, 1),
-        'away_win_pct': round(float(np.mean(~home_wins_mask)) * 100, 1),
-        'avg_total': round(float(np.mean(totals)), 2),
-        'avg_home_runs': round(float(np.mean(home_runs)), 2),
-        'avg_away_runs': round(float(np.mean(away_runs)), 2),
-        'home_lambda': round(home_lambda, 2),
-        'away_lambda': round(away_lambda, 2),
-        'over_probs': over_probs,
-        'simulations': n,
-    }
+    return {'home_win_pct': round(float(np.mean(home_wins_mask)) * 100, 1), 'away_win_pct': round(float(np.mean(~home_wins_mask)) * 100, 1), 'avg_total': round(float(np.mean(totals)), 2), 'avg_home_runs': round(float(np.mean(home_runs)), 2), 'avg_away_runs': round(float(np.mean(away_runs)), 2), 'home_lambda': round(home_lambda, 2), 'away_lambda': round(away_lambda, 2), 'over_probs': over_probs, 'simulations': n}
 
 
-def build_reasoning(game, hr, ar, reg_home_era, reg_away_era, mc, home_p, blended_home, vegas_home_pct, vegas_away_pct):
+def build_reasoning(game, hr, ar, reg_home_era, reg_away_era, home_metric, away_metric, mc, home_p, blended_home, vegas_home_pct):
     reasons = []
     rd_diff = hr['run_diff'] - ar['run_diff']
     if abs(rd_diff) >= 25:
@@ -159,36 +153,43 @@ def build_reasoning(game, hr, ar, reg_home_era, reg_away_era, mc, home_p, blende
         leader = game['home_team'] if rd_diff > 0 else game['away_team']
         reasons.append(f"Moderate run-differential edge to {leader} ({hr['run_diff']} vs {ar['run_diff']}).")
     else:
-        reasons.append("Season run differential is fairly close, so no major team-strength edge.")
-    era_gap = round(reg_away_era - reg_home_era, 2)
-    if abs(era_gap) >= 0.75:
-        leader = game['home_team'] if era_gap > 0 else game['away_team']
-        reasons.append(f"Starting-pitcher edge to {leader}; regressed ERA gap is {abs(era_gap):.2f}.")
-    elif abs(era_gap) >= 0.30:
-        leader = game['home_team'] if era_gap > 0 else game['away_team']
-        reasons.append(f"Slight starting-pitcher lean to {leader} after ERA regression.")
+        reasons.append('Season run differential is fairly close, so no major team-strength edge.')
+    metric_gap = round(away_metric - home_metric, 2)
+    if abs(metric_gap) >= 0.60:
+        leader = game['home_team'] if metric_gap > 0 else game['away_team']
+        reasons.append(f"Advanced starting-pitcher edge to {leader}; adjusted run-prevention gap is {abs(metric_gap):.2f}.")
     else:
-        reasons.append("Starting pitchers are close after sample-size regression.")
-    away_team = game['away_team']
-    home_team = game['home_team']
-    reasons.append(f"Projected team totals: {away_team} {mc['avg_away_runs']:.2f} runs, {home_team} {mc['avg_home_runs']:.2f} runs — game total {mc['avg_total']:.2f}.")
+        reasons.append('Advanced starter inputs are relatively close after regression and Statcast adjustments.')
+    reasons.append(f"Projected team totals: {game['away_team']} {mc['avg_away_runs']:.2f} runs, {game['home_team']} {mc['avg_home_runs']:.2f} runs — game total {mc['avg_total']:.2f}.")
     if mc['avg_away_runs'] > mc['avg_home_runs']:
-        reasons.append(f"{away_team} projected to score more: their offense baseline vs opponent regressed ERA produces a higher run expectation (lambda {mc['away_lambda']:.2f} vs {mc['home_lambda']:.2f}).")
+        reasons.append(f"{game['away_team']} projected to score more because its offense baseline and opponent pitching profile create a higher run expectation (lambda {mc['away_lambda']:.2f} vs {mc['home_lambda']:.2f}).")
     elif mc['avg_home_runs'] > mc['avg_away_runs']:
-        reasons.append(f"{home_team} projected to score more: their offense baseline vs opponent regressed ERA produces a higher run expectation (lambda {mc['home_lambda']:.2f} vs {mc['away_lambda']:.2f}).")
+        reasons.append(f"{game['home_team']} projected to score more because its offense baseline and opponent pitching profile create a higher run expectation (lambda {mc['home_lambda']:.2f} vs {mc['away_lambda']:.2f}).")
     else:
-        reasons.append("Both teams have nearly identical scoring environments; team totals are essentially even.")
+        reasons.append('Both teams project into almost identical scoring environments.')
+    reasons.append('Pitching inputs used include ERA, xERA, WHIP, K%, BB%, Whiff%, Hard-Hit%, and Barrel% when available.')
     if vegas_home_pct is not None:
         edge = round(blended_home * 100 - vegas_home_pct, 1)
         if abs(edge) >= 3:
-            if edge > 0:
-                reasons.append(f"Model is {edge:.1f}% higher on {home_team} than the market — potential value.")
-            else:
-                reasons.append(f"Model is {abs(edge):.1f}% lower on {home_team} than the market — potential value on {away_team}.")
+            reasons.append(f"Model-market gap on the home side is {edge:+.1f}% after blending analytical and Monte Carlo outputs.")
         else:
-            reasons.append("Model and market are closely aligned; no strong disagreement.")
-    reasons.append(f"Final: analytical model {home_p*100:.1f}% blended 55/45 with Monte Carlo → {blended_home*100:.1f}% {home_team} / {(1-blended_home)*100:.1f}% {away_team}.")
+            reasons.append('Model and market are mostly aligned on the side.')
+    reasons.append(f"Final home win probability: base/log5 + team strength + advanced pitching adjustment, then blended 55/45 with Monte Carlo to {blended_home*100:.1f}%.")
     return reasons
+
+
+def _extract_book_total(odds):
+    totals = odds.get('totals', {}) or {}
+    over = totals.get('Over') or totals.get('over') or {}
+    under = totals.get('Under') or totals.get('under') or {}
+    return over.get('point') if over.get('point') is not None else under.get('point')
+
+
+def _extract_team_total(team_totals, team_name, side='Over'):
+    for row in (team_totals or {}).values():
+        if row.get('team') == team_name and str(row.get('side', '')).lower() == side.lower():
+            return {'line': row.get('point'), 'odds': row.get('price'), 'bookmaker': row.get('bookmaker')}
+    return {}
 
 
 def model_game(game, records):
@@ -197,8 +198,7 @@ def model_game(game, records):
     odds = game.get('odds', {})
     hr = records.get(home, {'pyth': 0.5, 'win_pct': 0.5, 'run_diff': 0, 'gp': 0, 'rs_per_g': LEAGUE_AVG_RPG, 'ra_per_g': LEAGUE_AVG_RPG, 'wins': 0, 'losses': 0})
     ar = records.get(away, {'pyth': 0.5, 'win_pct': 0.5, 'run_diff': 0, 'gp': 0, 'rs_per_g': LEAGUE_AVG_RPG, 'ra_per_g': LEAGUE_AVG_RPG, 'wins': 0, 'losses': 0})
-    base_home = log5(hr['pyth'], ar['pyth']) + 0.035
-    base_home = min(0.70, max(0.30, base_home))
+    base_home = min(0.70, max(0.30, log5(hr['pyth'], ar['pyth']) + 0.035))
     home_pitcher_stats = game.get('home_pitcher_stats', {}) or {}
     away_pitcher_stats = game.get('away_pitcher_stats', {}) or {}
     home_era_raw = _safe_float(home_pitcher_stats.get('era'), LEAGUE_AVG_ERA)
@@ -207,9 +207,11 @@ def model_game(game, records):
     away_ip = _safe_ip(away_pitcher_stats.get('ip'), 0.0)
     home_era_reg = regress_era(home_era_raw, home_ip)
     away_era_reg = regress_era(away_era_raw, away_ip)
-    era_adj = float(np.clip((away_era_reg - home_era_reg) * 0.018, -0.09, 0.09))
+    home_pitch_metric = advanced_pitching_score({**home_pitcher_stats, 'xera': home_pitcher_stats.get('xera', home_era_reg), 'era': home_era_reg})
+    away_pitch_metric = advanced_pitching_score({**away_pitcher_stats, 'xera': away_pitcher_stats.get('xera', away_era_reg), 'era': away_era_reg})
+    era_adj = float(np.clip((away_pitch_metric - home_pitch_metric) * 0.022, -0.10, 0.10))
     home_p = min(0.74, max(0.26, base_home + era_adj))
-    mc = monte_carlo_game(hr.get('rs_per_g', LEAGUE_AVG_RPG), ar.get('rs_per_g', LEAGUE_AVG_RPG), home_era_reg, away_era_reg)
+    mc = monte_carlo_game(hr.get('rs_per_g', LEAGUE_AVG_RPG), ar.get('rs_per_g', LEAGUE_AVG_RPG), home_pitch_metric, away_pitch_metric)
     blended_home = min(MAX_WIN_PCT, max(MIN_WIN_PCT, home_p * 0.55 + (mc['home_win_pct'] / 100) * 0.45))
     blended_away = 1 - blended_home
     projected_winner = home if blended_home >= blended_away else away
@@ -222,16 +224,7 @@ def model_game(game, records):
         impl = am_to_prob(am_odds)
         edge = model_prob - impl
         if edge >= EDGE_THRESHOLD:
-            value_bets.append({
-                'type': bet_type, 'pick': pick_label, 'odds': am_odds,
-                'model_prob_pct': round(model_prob * 100, 1),
-                'implied_prob_pct': round(impl * 100, 1),
-                'model_fair_odds': prob_to_american(model_prob),
-                'edge_pct': round(edge * 100, 1),
-                'kelly_pct': round(kelly(model_prob, am_odds) * 100, 2),
-                'confidence': 'HIGH' if edge >= HIGH_EDGE else 'MEDIUM',
-                'mc_pct': round((mc_prob if mc_prob is not None else model_prob) * 100, 1),
-            })
+            value_bets.append({'type': bet_type, 'pick': pick_label, 'odds': am_odds, 'model_prob_pct': round(model_prob * 100, 1), 'implied_prob_pct': round(impl * 100, 1), 'model_fair_odds': prob_to_american(model_prob), 'edge_pct': round(edge * 100, 1), 'kelly_pct': round(kelly(model_prob, am_odds) * 100, 2), 'confidence': 'HIGH' if edge >= HIGH_EDGE else 'MEDIUM', 'mc_pct': round((mc_prob if mc_prob is not None else model_prob) * 100, 1)})
 
     h2h = odds.get('h2h', {})
     home_ml = (h2h.get(home) or {}).get('price')
@@ -261,45 +254,11 @@ def model_game(game, records):
         adj = min(0.68, max(0.32, (hf5 if name == home else af5) * RL_CONV))
         if adj > 0.50:
             check_bet('F5 RL', f'{name} F5 {d.get("point", "")}'.strip(), d.get('price'), adj)
-    game_total_odds = odds.get('totals', {})
-    vegas_total_line = None
-    for _, v in game_total_odds.items():
-        if v.get('point') is not None:
-            vegas_total_line = v['point']
-            break
-    team_totals = {'away': {}, 'home': {}}
-    for name, data in odds.get('team_totals', {}).items():
-        if name == away:
-            team_totals['away'] = {'line': data.get('point'), 'odds': data.get('price')}
-        elif name == home:
-            team_totals['home'] = {'line': data.get('point'), 'odds': data.get('price')}
-    reasons = build_reasoning(game, hr, ar, home_era_reg, away_era_reg, mc, home_p, blended_home, vegas_home_pct, vegas_away_pct)
-    return {
-        'home_win_pct': round(blended_home * 100, 1),
-        'away_win_pct': round(blended_away * 100, 1),
-        'home_record': f"{hr.get('wins',0)}-{hr.get('losses',0)}",
-        'away_record': f"{ar.get('wins',0)}-{ar.get('losses',0)}",
-        'vegas_home_pct': vegas_home_pct,
-        'vegas_away_pct': vegas_away_pct,
-        'vegas_total_line': vegas_total_line,
-        'vegas_home_odds': home_ml,
-        'vegas_away_odds': away_ml,
-        'model_home_fair_odds': prob_to_american(blended_home),
-        'model_away_fair_odds': prob_to_american(blended_away),
-        'home_era_raw': round(home_era_raw, 2),
-        'away_era_raw': round(away_era_raw, 2),
-        'home_era_reg': home_era_reg,
-        'away_era_reg': away_era_reg,
-        'projected_winner': projected_winner,
-        'projected_loser': projected_loser,
-        'projected_away_runs': mc['avg_away_runs'],
-        'projected_home_runs': mc['avg_home_runs'],
-        'projected_total_runs': mc['avg_total'],
-        'team_totals_market': team_totals,
-        'monte_carlo': mc,
-        'reasoning': reasons,
-        'value_bets': value_bets,
-    }
+    vegas_total_line = _extract_book_total(odds)
+    team_totals_market = odds.get('team_totals', {}) or {}
+    team_totals = {'away': _extract_team_total(team_totals_market, away, 'Over'), 'home': _extract_team_total(team_totals_market, home, 'Over')}
+    reasons = build_reasoning(game, hr, ar, home_era_reg, away_era_reg, home_pitch_metric, away_pitch_metric, mc, home_p, blended_home, vegas_home_pct)
+    return {'home_win_pct': round(blended_home * 100, 1), 'away_win_pct': round(blended_away * 100, 1), 'home_record': f"{hr.get('wins',0)}-{hr.get('losses',0)}", 'away_record': f"{ar.get('wins',0)}-{ar.get('losses',0)}", 'vegas_home_pct': vegas_home_pct, 'vegas_away_pct': vegas_away_pct, 'vegas_total_line': vegas_total_line, 'vegas_home_odds': home_ml, 'vegas_away_odds': away_ml, 'model_home_fair_odds': prob_to_american(blended_home), 'model_away_fair_odds': prob_to_american(blended_away), 'home_era_raw': round(home_era_raw, 2), 'away_era_raw': round(away_era_raw, 2), 'home_era_reg': home_era_reg, 'away_era_reg': away_era_reg, 'home_pitch_metric': round(home_pitch_metric, 2), 'away_pitch_metric': round(away_pitch_metric, 2), 'projected_winner': projected_winner, 'projected_loser': projected_loser, 'projected_away_runs': mc['avg_away_runs'], 'projected_home_runs': mc['avg_home_runs'], 'projected_total_runs': mc['avg_total'], 'team_totals_market': team_totals, 'monte_carlo': mc, 'reasoning': reasons, 'value_bets': value_bets}
 
 
 def run_all_predictions(games, records):
