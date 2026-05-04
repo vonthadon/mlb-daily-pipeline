@@ -1,0 +1,48 @@
+name: ⚾ MLB Daily Betting Pipeline
+
+on:
+  schedule:
+    # Runs daily at 5:15 PM ET (21:15 UTC / EDT)
+    # Lineups are typically confirmed by 3-4 PM ET
+    - cron: '15 21 * * *'
+  workflow_dispatch:
+    inputs:
+      date:
+        description: 'Override date (YYYY-MM-DD). Leave blank for today.'
+        required: false
+        default: ''
+
+jobs:
+  run-pipeline:
+    name: Run MLB Pipeline
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run pipeline
+        env:
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          EMAIL_ADDRESS: ${{ secrets.EMAIL_ADDRESS }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          TARGET_DATE: ${{ github.event.inputs.date }}
+        run: python main.py
+
+      - name: Upload report artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mlb-report-${{ github.run_id }}
+          path: output/
+          retention-days: 14
