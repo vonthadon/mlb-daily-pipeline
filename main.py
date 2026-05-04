@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import zipfile
 import logging
 from datetime import date, datetime, timezone, timedelta
 from pathlib import Path
@@ -110,7 +111,6 @@ def detect_mode():
     now_et = datetime.now(ET)
     if now_et.hour == 10:
         return 'morning'
-    # After 11 PM ET check if all games done -> results mode
     if now_et.hour >= 23 or now_et.hour < 6:
         return 'results'
     return 'pregame'
@@ -128,25 +128,49 @@ def build_pipeline(target_date):
     logger.info(f'  {len(games)} merged games')
     logger.info('Fetching pitcher stats + Savant advanced metrics...')
     for g in games:
-        g['home_pitcher_stats'] = get_pitcher_stats(g.get('home_pitcher_id'), pitcher_name=g.get('home_pitcher'))
-        g['away_pitcher_stats'] = get_pitcher_stats(g.get('away_pitcher_id'), pitcher_name=g.get('away_pitcher'))
+        g['home_pitcher_stats'] = get_pitcher_stats(
+            g.get('home_pitcher_id'), pitcher_name=g.get('home_pitcher')
+        )
+        g['away_pitcher_stats'] = get_pitcher_stats(
+            g.get('away_pitcher_id'), pitcher_name=g.get('away_pitcher')
+        )
     logger.info('Fetching weather...')
     for g in games:
-        g['weather'] = get_game_weather(g.get('home_team', ''), g.get('commence_time') or g.get('game_date', ''))
+        g['weather'] = get_game_weather(
+            g.get('home_team', ''), g.get('commence_time') or g.get('game_date', '')
+        )
     logger.info('Running model + Monte Carlo (25k sims)...')
     records = get_team_standings()
     logger.info(f'  {len(records)} team records loaded')
     return run_all_predictions(games, records)
 
 
-def make_output(games, target_date):
+def make_zip(games, target_date):
+    """Build all output files then bundle them into a single ZIP and return its path."""
     OUTPUT_DIR.mkdir(exist_ok=True)
+
+    # HTML detail report
     detail_html = generate_detail_html(games, target_date)
     detail_path = OUTPUT_DIR / 'full_report.html'
     detail_path.write_text(detail_html, encoding='utf-8')
-    generate_csv_files(games, OUTPUT_DIR)
-    (OUTPUT_DIR / 'raw_data.json').write_text(json.dumps(games, indent=2, default=str))
-    return OUTPUT_DIR / f'mlb_report_{target_date}.csv'
+
+    # CSV files
+    csv_files = generate_csv_files(games, OUTPUT_DIR)
+
+    # Raw JSON
+    json_path = OUTPUT_DIR / 'raw_data.json'
+    json_path.write_text(json.dumps(games, indent=2, default=str))
+
+    # Build ZIP
+    zip_path = OUTPUT_DIR / f'mlb_report_{target_date}.zip'
+    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+        zf.write(detail_path, 'full_report.html')
+        for f in csv_files:
+            zf.write(f, Path(f).name)
+        zf.write(json_path, 'raw_data.json')
+
+    logger.info(f'ZIP created: {zip_path} ({zip_path.stat().st_size / 1024:.1f} KB)')
+    return zip_path
 
 
 def run_results_mode(target_date, from_email, password):
@@ -207,13 +231,13 @@ def main():
             logger.info('No new pregame windows found \u2014 exiting.')
             return
         email_html = generate_email_html(games, target_date, mode='pregame', soon_game_pks=set(new_pks))
-        csv_ref = make_output(games, target_date)
+        zip_path = make_zip(games, target_date)
         save_picks(games, target_date)
         if from_email and password:
             send_daily_email(
                 to_email='Vonthadon444@gmail.com', from_email=from_email,
                 password=password, html_content=email_html,
-                attachment_path=str(csv_ref), date_str=target_date,
+                attachment_path=str(zip_path), date_str=target_date,
                 predictions=games,
                 subject_override=(
                     f"\ud83d\udd14 PREGAME ALERT {target_date} \u2014 "
@@ -225,13 +249,13 @@ def main():
             logger.warning('No email credentials \u2014 skipping send')
     else:
         email_html = generate_email_html(games, target_date, mode=mode)
-        csv_ref = make_output(games, target_date)
+        zip_path = make_zip(games, target_date)
         save_picks(games, target_date)
         if from_email and password:
             send_daily_email(
                 to_email='Vonthadon444@gmail.com', from_email=from_email,
                 password=password, html_content=email_html,
-                attachment_path=str(csv_ref), date_str=target_date,
+                attachment_path=str(zip_path), date_str=target_date,
                 predictions=games
             )
         else:
