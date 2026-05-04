@@ -4,23 +4,26 @@ on:
   schedule:
     # ── Morning slate: 10:00 AM ET = 14:00 UTC ──────────────────────────────
     - cron: '0 14 * * *'
-    # ── Pregame polling: every 30 min, 11 AM → 1 AM ET ──────────────────────
-    # 11:00 AM – 11:30 PM ET  (15:00 – 23:30 UTC)
+    # ── Pregame polling: every 30 min, 11 AM → 11 PM ET ─────────────────────
     - cron: '0,30 15-23 * * *'
-    # 12:00 AM – 1:00 AM ET  (00:00 – 05:00 UTC next day)
+    # ── Late pregame / overnight: 12 AM – 5 AM ET ───────────────────────────
     - cron: '0,30 0-5 * * *'
+    # ── Results check: every 30 min from 10 PM → 2 AM ET ────────────────────
+    # 10 PM–11:30 PM ET = 02:00–03:30 UTC next day
+    - cron: '0,30 2-6 * * *'
 
   workflow_dispatch:
     inputs:
       mode:
         description: 'Run mode'
         required: false
-        default: 'full'
+        default: 'morning'
         type: choice
         options:
-          - full
           - morning
           - pregame
+          - results
+          - full
       date:
         description: 'Date override (YYYY-MM-DD) — leave blank for today'
         required: false
@@ -32,7 +35,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     permissions:
-      contents: write   # needed to commit state file
+      contents: write
 
     steps:
       - name: Checkout
@@ -43,25 +46,28 @@ jobs:
         run: echo "TODAY=$(date -u +%Y-%m-%d)" >> "$GITHUB_ENV"
 
       - name: Determine run mode
-        id: mode
         run: |
-          HOUR=$(date -u +%H)
-          if [ "${{ github.event.inputs.mode }}" != "" ]; then
-            echo "RUN_MODE=${{ github.event.inputs.mode }}" >> "$GITHUB_ENV"
-          elif [ "$HOUR" = "14" ]; then
+          HOUR=$(TZ=America/New_York date +%H)
+          MANUAL="${{ github.event.inputs.mode }}"
+          if [ -n "$MANUAL" ]; then
+            echo "RUN_MODE=$MANUAL" >> "$GITHUB_ENV"
+          elif [ "$HOUR" = "10" ]; then
             echo "RUN_MODE=morning" >> "$GITHUB_ENV"
+          elif [ "$HOUR" -ge 22 ] || [ "$HOUR" -lt 6 ]; then
+            echo "RUN_MODE=results" >> "$GITHUB_ENV"
           else
             echo "RUN_MODE=pregame" >> "$GITHUB_ENV"
           fi
 
-      - name: Restore pregame sent-state cache
+      - name: Restore picks + pregame state cache
         uses: actions/cache@v4
-        if: env.RUN_MODE == 'pregame'
         with:
-          path: sent_pregame.json
-          key: pregame-state-${{ env.TODAY }}-${{ github.run_number }}
+          path: |
+            sent_pregame.json
+            saved_picks.json
+          key: mlb-state-${{ env.TODAY }}-${{ github.run_number }}
           restore-keys: |
-            pregame-state-${{ env.TODAY }}-
+            mlb-state-${{ env.TODAY }}-
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5

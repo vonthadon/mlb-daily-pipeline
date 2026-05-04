@@ -1,7 +1,6 @@
 import os
 import sys
 import json
-import zipfile
 import logging
 from datetime import date, datetime, timezone, timedelta
 from pathlib import Path
@@ -16,7 +15,11 @@ from scripts.fetch_lineups import get_todays_games, get_pitcher_stats
 from scripts.fetch_weather import get_game_weather
 from scripts.model import get_team_standings, run_all_predictions
 from scripts.generate_report import generate_email_html, generate_detail_html, generate_csv_files
-from scripts.send_email import send_daily_email
+from scripts.send_email import send_daily_email, send_results_email
+from scripts.results_checker import (
+    save_picks, load_picks, grade_picks, all_games_final,
+    generate_results_html, save_results_csv
+)
 
 OUTPUT_DIR = Path('output')
 SENT_STATE = Path('sent_pregame.json')
@@ -47,7 +50,17 @@ def merge_games(mlb_games, odds_games):
     for og in odds_games:
         k = (normalize(og['home_team']), normalize(og['away_team']))
         if k not in covered:
-            merged.append({'home_team': og['home_team'], 'away_team': og['away_team'], 'commence_time': og.get('commence_time', ''), 'game_date': og.get('commence_time', ''), 'status': 'Scheduled', 'venue': '', 'home_pitcher': 'TBD', 'away_pitcher': 'TBD', 'home_pitcher_id': None, 'away_pitcher_id': None, 'home_lineup': [], 'away_lineup': [], 'odds': og.get('odds', {}), 'home_pitcher_stats': {}, 'away_pitcher_stats': {}})
+            merged.append({
+                'home_team': og['home_team'], 'away_team': og['away_team'],
+                'commence_time': og.get('commence_time', ''),
+                'game_date': og.get('commence_time', ''),
+                'status': 'Scheduled', 'venue': '',
+                'home_pitcher': 'TBD', 'away_pitcher': 'TBD',
+                'home_pitcher_id': None, 'away_pitcher_id': None,
+                'home_lineup': [], 'away_lineup': [],
+                'odds': og.get('odds', {}),
+                'home_pitcher_stats': {}, 'away_pitcher_stats': {}
+            })
     return merged
 
 
@@ -92,9 +105,15 @@ def games_starting_soon(games, minutes_lo=60, minutes_hi=90):
 
 def detect_mode():
     mode = (os.environ.get('RUN_MODE') or '').strip().lower()
-    if mode in ('morning', 'pregame', 'full'):
+    if mode in ('morning', 'pregame', 'results', 'full'):
         return mode
-    return 'morning' if datetime.now(ET).hour == 10 else 'pregame'
+    now_et = datetime.now(ET)
+    if now_et.hour == 10:
+        return 'morning'
+    # After 11 PM ET check if all games done -> results mode
+    if now_et.hour >= 23 or now_et.hour < 6:
+        return 'results'
+    return 'pregame'
 
 
 def build_pipeline(target_date):
@@ -120,64 +139,106 @@ def build_pipeline(target_date):
     return run_all_predictions(games, records)
 
 
-def make_zip(games, target_date, detail_html):
+def make_output(games, target_date):
     OUTPUT_DIR.mkdir(exist_ok=True)
+    detail_html = generate_detail_html(games, target_date)
     detail_path = OUTPUT_DIR / 'full_report.html'
     detail_path.write_text(detail_html, encoding='utf-8')
-    csv_files = generate_csv_files(games, OUTPUT_DIR)
+    generate_csv_files(games, OUTPUT_DIR)
     (OUTPUT_DIR / 'raw_data.json').write_text(json.dumps(games, indent=2, default=str))
-    zip_path = OUTPUT_DIR / f'mlb_report_{target_date}.zip'
-    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-        zf.write(detail_path, 'full_report.html')
-        for f in csv_files:
-            zf.write(f, f.name)
-    return zip_path
+    return OUTPUT_DIR / f'mlb_report_{target_date}.csv'
 
 
-def send(games, email_html, zip_path, target_date, mode, from_email, password, soon_pks=None):
-    all_bets = [b for g in games for b in g.get('predictions', {}).get('value_bets', [])]
-    high = [b for b in all_bets if b.get('confidence') == 'HIGH']
-    label = {'morning': '☀️ MORNING SLATE', 'pregame': '🔔 PREGAME ALERT', 'full': '⚾ DAILY REPORT'}.get(mode, 'REPORT')
-    subject = f"{label} {target_date} — {len(games)} Games | {len(all_bets)} Bets ({len(high)} HIGH)"
-    if mode == 'pregame' and soon_pks:
-        subject = f"🔔 PREGAME ALERT {target_date} — {len(soon_pks)} game(s) in ~1hr | {len(all_bets)} bets"
-    send_daily_email(to_email='Vonthadon444@gmail.com', from_email=from_email, password=password, html_content=email_html, attachment_path=str(zip_path), date_str=target_date, predictions=games, subject_override=subject)
+def run_results_mode(target_date, from_email, password):
+    logger.info(f'=== RESULTS MODE --- {target_date} ===')
+    if not all_games_final(target_date):
+        logger.info('Not all games finished yet --- skipping results email.')
+        return
+    picks = load_picks(target_date)
+    if not picks:
+        logger.info('No saved picks found for today --- nothing to grade.')
+        return
+    results = grade_picks(picks)
+    wins = sum(1 for r in results if r['result'] == 'WIN')
+    losses = sum(1 for r in results if r['result'] == 'LOSS')
+    logger.info(f'Graded {len(results)} picks: {wins}W {losses}L')
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    csv_path = OUTPUT_DIR / f'results_{target_date}.csv'
+    save_results_csv(results, csv_path)
+    html = generate_results_html(results, target_date)
+    subject = (
+        f"\ud83d\udccb MLB Results {target_date} \u2014 "
+        f"{wins}W / {losses}L on {len(results)} model picks"
+    )
+    if from_email and password:
+        send_results_email(
+            to_email='Vonthadon444@gmail.com',
+            from_email=from_email,
+            password=password,
+            html_content=html,
+            csv_path=str(csv_path),
+            date_str=target_date,
+            subject_override=subject
+        )
+    else:
+        logger.warning('No email credentials --- skipping results send')
 
 
 def main():
     target_date = (os.environ.get('TARGET_DATE') or '').strip() or date.today().strftime('%Y-%m-%d')
     mode = detect_mode()
     OUTPUT_DIR.mkdir(exist_ok=True)
-    logger.info(f'=== MLB Pipeline [{mode.upper()}] — {target_date} ===')
+    logger.info(f'=== MLB Pipeline [{mode.upper()}] \u2014 {target_date} ===')
     from_email = os.environ.get('EMAIL_ADDRESS', '').strip()
     password = os.environ.get('EMAIL_PASSWORD', '').strip()
+
+    if mode == 'results':
+        run_results_mode(target_date, from_email, password)
+        return
+
     games = build_pipeline(target_date)
+
     if mode == 'pregame':
         sent_pks = load_sent_state()
-        soon_pks_all, soon_games = games_starting_soon(games, minutes_lo=60, minutes_hi=90)
+        soon_pks_all, _ = games_starting_soon(games, minutes_lo=60, minutes_hi=90)
         new_pks = [pk for pk in soon_pks_all if pk not in sent_pks]
-        new_soon_games = [g for g in soon_games if g.get('game_pk') in new_pks]
+        new_soon_games = [g for g in games if g.get('game_pk') in new_pks]
         if not new_soon_games:
-            logger.info('No new pregame windows found — exiting.')
+            logger.info('No new pregame windows found \u2014 exiting.')
             return
         email_html = generate_email_html(games, target_date, mode='pregame', soon_game_pks=set(new_pks))
-        detail_html = generate_detail_html(games, target_date)
-        zip_path = make_zip(games, target_date, detail_html)
+        csv_ref = make_output(games, target_date)
+        save_picks(games, target_date)
         if from_email and password:
-            send(games, email_html, zip_path, target_date, mode, from_email, password, new_pks)
+            send_daily_email(
+                to_email='Vonthadon444@gmail.com', from_email=from_email,
+                password=password, html_content=email_html,
+                attachment_path=str(csv_ref), date_str=target_date,
+                predictions=games,
+                subject_override=(
+                    f"\ud83d\udd14 PREGAME ALERT {target_date} \u2014 "
+                    f"{len(new_pks)} game(s) in ~1hr"
+                )
+            )
             save_sent_state(sent_pks | set(new_pks))
         else:
-            logger.warning('No email credentials — skipping send')
+            logger.warning('No email credentials \u2014 skipping send')
     else:
         email_html = generate_email_html(games, target_date, mode=mode)
-        detail_html = generate_detail_html(games, target_date)
-        zip_path = make_zip(games, target_date, detail_html)
+        csv_ref = make_output(games, target_date)
+        save_picks(games, target_date)
         if from_email and password:
-            send(games, email_html, zip_path, target_date, mode, from_email, password)
+            send_daily_email(
+                to_email='Vonthadon444@gmail.com', from_email=from_email,
+                password=password, html_content=email_html,
+                attachment_path=str(csv_ref), date_str=target_date,
+                predictions=games
+            )
         else:
-            logger.warning('No email credentials — skipping send')
+            logger.warning('No email credentials \u2014 skipping send')
+
     all_bets = [b for g in games for b in g.get('predictions', {}).get('value_bets', [])]
-    logger.info(f'=== DONE — {len(games)} games | {len(all_bets)} value bets ===')
+    logger.info(f'=== DONE \u2014 {len(games)} games | {len(all_bets)} value bets ===')
 
 
 if __name__ == '__main__':
