@@ -2,13 +2,27 @@ name: ⚾ MLB Daily Betting Pipeline
 
 on:
   schedule:
-    # Runs daily at 5:15 PM ET (21:15 UTC / EDT)
-    # Lineups are typically confirmed by 3-4 PM ET
-    - cron: '15 21 * * *'
+    # ── Morning slate: 10:00 AM ET = 14:00 UTC ──────────────────────────────
+    - cron: '0 14 * * *'
+    # ── Pregame polling: every 30 min, 11 AM → 1 AM ET ──────────────────────
+    # 11:00 AM – 11:30 PM ET  (15:00 – 23:30 UTC)
+    - cron: '0,30 15-23 * * *'
+    # 12:00 AM – 1:00 AM ET  (00:00 – 05:00 UTC next day)
+    - cron: '0,30 0-5 * * *'
+
   workflow_dispatch:
     inputs:
+      mode:
+        description: 'Run mode'
+        required: false
+        default: 'full'
+        type: choice
+        options:
+          - full
+          - morning
+          - pregame
       date:
-        description: 'Override date (YYYY-MM-DD). Leave blank for today.'
+        description: 'Date override (YYYY-MM-DD) — leave blank for today'
         required: false
         default: ''
 
@@ -16,11 +30,38 @@ jobs:
   run-pipeline:
     name: Run MLB Pipeline
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
+    permissions:
+      contents: write   # needed to commit state file
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Set today's date
+        id: today
+        run: echo "TODAY=$(date -u +%Y-%m-%d)" >> "$GITHUB_ENV"
+
+      - name: Determine run mode
+        id: mode
+        run: |
+          HOUR=$(date -u +%H)
+          if [ "${{ github.event.inputs.mode }}" != "" ]; then
+            echo "RUN_MODE=${{ github.event.inputs.mode }}" >> "$GITHUB_ENV"
+          elif [ "$HOUR" = "14" ]; then
+            echo "RUN_MODE=morning" >> "$GITHUB_ENV"
+          else
+            echo "RUN_MODE=pregame" >> "$GITHUB_ENV"
+          fi
+
+      - name: Restore pregame sent-state cache
+        uses: actions/cache@v4
+        if: env.RUN_MODE == 'pregame'
+        with:
+          path: sent_pregame.json
+          key: pregame-state-${{ env.TODAY }}-${{ github.run_number }}
+          restore-keys: |
+            pregame-state-${{ env.TODAY }}-
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
@@ -37,12 +78,13 @@ jobs:
           EMAIL_ADDRESS: ${{ secrets.EMAIL_ADDRESS }}
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
           TARGET_DATE: ${{ github.event.inputs.date }}
+          RUN_MODE: ${{ env.RUN_MODE }}
         run: python main.py
 
       - name: Upload report artifacts
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: mlb-report-${{ github.run_id }}
+          name: mlb-${{ env.RUN_MODE }}-${{ env.TODAY }}-${{ github.run_number }}
           path: output/
           retention-days: 14
